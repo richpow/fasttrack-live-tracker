@@ -1,5 +1,5 @@
 import pkgConnector from 'tiktok-live-connector';
-const { TikTokLiveConnection, WebcastEvent } = pkgConnector;
+const { WebcastPushConnection, WebcastEvent } = pkgConnector;
 
 import pkg from 'pg';
 const { Pool } = pkg;
@@ -13,6 +13,12 @@ const active = new Map();
 
 console.log("STARTED");
 
+// CONFIG
+const MAX_RETRIES = 2;
+const CONNECT_TIMEOUT = 5000;
+const BATCH_SIZE = 25;
+const BATCH_DELAY = 300;
+
 // GET CREATORS (EXCLUDES QUIT)
 async function getCreators() {
   const res = await pool.query(`
@@ -24,77 +30,90 @@ async function getCreators() {
   return res.rows.map(r => r.username);
 }
 
-// MAIN TRACK FUNCTION (NO SEPARATE isLive)
-async function tryTrack(username) {
-  if (active.has(username)) return;
+// TRY CONNECT WITH RETRY
+async function tryConnect(username) {
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    const conn = new WebcastPushConnection(username);
 
-  const conn = new TikTokLiveConnection(username);
+    try {
+      const connectPromise = conn.connect();
 
-  try {
-    // Attempt to connect → THIS is the live check
-    await conn.connect();
-
-    console.log("LIVE:", username);
-
-    const session = await pool.query(
-      "INSERT INTO live_sessions (username) VALUES ($1) RETURNING id",
-      [username]
-    );
-
-    const sessionId = session.rows[0].id;
-
-    conn.on(WebcastEvent.GIFT, async (data) => {
-      const total = data.diamondCount * (data.repeatCount || 1);
-
-      await pool.query(
-        `INSERT INTO live_gift_events 
-        (session_id, username, gifter_username, gifter_display_name, gift_name, total_diamonds) 
-        VALUES ($1,$2,$3,$4,$5,$6)`,
-        [
-          sessionId,
-          username,
-          data.uniqueId,
-          data.nickname,
-          data.giftName,
-          total
-        ]
-      );
-    });
-
-    conn.on("disconnected", async () => {
-      console.log("ENDED:", username);
-
-      await pool.query(
-        "UPDATE live_sessions SET ended_at = NOW() WHERE id = $1",
-        [sessionId]
+      const timeoutPromise = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("timeout")), CONNECT_TIMEOUT)
       );
 
-      active.delete(username);
-    });
+      await Promise.race([connectPromise, timeoutPromise]);
 
-    active.set(username, conn);
+      return conn; // success
 
-  } catch {
-    // Not live → silently ignore
+    } catch {
+      try { conn.disconnect(); } catch {}
+    }
   }
+  return null;
 }
 
-// POLLING WITH CONTROLLED CONCURRENCY
+// TRACK
+async function track(username) {
+  if (active.has(username)) return;
+
+  const conn = await tryConnect(username);
+  if (!conn) return;
+
+  console.log("LIVE:", username);
+
+  const session = await pool.query(
+    "INSERT INTO live_sessions (username) VALUES ($1) RETURNING id",
+    [username]
+  );
+
+  const sessionId = session.rows[0].id;
+
+  conn.on(WebcastEvent.GIFT, async (data) => {
+    const total = data.diamondCount * (data.repeatCount || 1);
+
+    await pool.query(
+      `INSERT INTO live_gift_events 
+      (session_id, username, gifter_username, gifter_display_name, gift_name, total_diamonds) 
+      VALUES ($1,$2,$3,$4,$5,$6)`,
+      [
+        sessionId,
+        username,
+        data.uniqueId,
+        data.nickname,
+        data.giftName,
+        total
+      ]
+    );
+  });
+
+  conn.on("disconnected", async () => {
+    console.log("ENDED:", username);
+
+    await pool.query(
+      "UPDATE live_sessions SET ended_at = NOW() WHERE id = $1",
+      [sessionId]
+    );
+
+    active.delete(username);
+  });
+
+  active.set(username, conn);
+}
+
+// POLL
 async function poll() {
   console.log("Polling...");
 
   try {
     const creators = await getCreators();
 
-    // Limit parallel attempts to avoid overload
-    const chunkSize = 50;
+    for (let i = 0; i < creators.length; i += BATCH_SIZE) {
+      const batch = creators.slice(i, i + BATCH_SIZE);
 
-    for (let i = 0; i < creators.length; i += chunkSize) {
-      const chunk = creators.slice(i, i + chunkSize);
+      await Promise.all(batch.map(username => track(username)));
 
-      await Promise.all(
-        chunk.map(username => tryTrack(username))
-      );
+      await new Promise(r => setTimeout(r, BATCH_DELAY));
     }
 
   } catch (err) {
