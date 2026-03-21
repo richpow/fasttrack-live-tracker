@@ -1,0 +1,13 @@
+{
+  "name": "live-tracker",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "pg": "^8.11.0",
+    "tiktok-live-connector": "^1.1.7"
+  }
+}
