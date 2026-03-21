@@ -1,4 +1,6 @@
-import { TikTokLiveConnection, WebcastEvent } from 'tiktok-live-connector';
+import pkgConnector from 'tiktok-live-connector';
+const { TikTokLiveConnection, WebcastEvent } = pkgConnector;
+
 import pkg from 'pg';
 const { Pool } = pkg;
 
@@ -9,6 +11,7 @@ const pool = new Pool({
 
 const active = new Map();
 
+// GET CREATORS (EXCLUDES QUIT)
 async function getCreators() {
   const res = await pool.query(`
     SELECT username 
@@ -19,6 +22,7 @@ async function getCreators() {
   return res.rows.map(r => r.username);
 }
 
+// CHECK IF LIVE
 async function isLive(username) {
   try {
     const conn = new TikTokLiveConnection(username);
@@ -29,6 +33,7 @@ async function isLive(username) {
   }
 }
 
+// START TRACKING
 async function track(username) {
   if (active.has(username)) return;
 
@@ -76,6 +81,7 @@ async function track(username) {
   active.set(username, conn);
 }
 
+// POLL EVERY 30 SECONDS
 async function poll() {
   const creators = await getCreators();
 
