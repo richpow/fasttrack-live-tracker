@@ -1,5 +1,5 @@
 import pkgConnector from 'tiktok-live-connector';
-const { WebcastPushConnection, WebcastEvent } = pkgConnector;
+const { WebcastPushConnection } = pkgConnector;
 
 import pkg from 'pg';
 const { Pool } = pkg;
@@ -11,26 +11,32 @@ const pool = new Pool({
 
 const active = new Map();
 
-console.log("STARTED");
-
-// CONFIG
 const MAX_RETRIES = 2;
 const CONNECT_TIMEOUT = 5000;
 const BATCH_SIZE = 25;
-const BATCH_DELAY = 300;
+const BATCH_DELAY = 30000 / Math.ceil(1649 / 25) > 0 ? 300 : 300;
 
-// GET CREATORS (EXCLUDES QUIT)
+console.log("STARTED");
+
+process.on('unhandledRejection', (err) => {
+  console.error('UNHANDLED REJECTION:', err);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('UNCAUGHT EXCEPTION:', err);
+});
+
 async function getCreators() {
   const res = await pool.query(`
-    SELECT username 
-    FROM users 
+    SELECT username
+    FROM users
     WHERE username IS NOT NULL
-    AND agency_status != 'Quit'
+      AND agency_status != 'Quit'
   `);
-  return res.rows.map(r => r.username);
+
+  return res.rows.map(row => row.username);
 }
 
-// TRY CONNECT WITH RETRY
 async function tryConnect(username) {
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     const conn = new WebcastPushConnection(username);
@@ -38,22 +44,22 @@ async function tryConnect(username) {
     try {
       const connectPromise = conn.connect();
 
-      const timeoutPromise = new Promise((_, reject) =>
-        setTimeout(() => reject(new Error("timeout")), CONNECT_TIMEOUT)
-      );
+      const timeoutPromise = new Promise((_, reject) => {
+        setTimeout(() => reject(new Error("timeout")), CONNECT_TIMEOUT);
+      });
 
       await Promise.race([connectPromise, timeoutPromise]);
-
-      return conn; // success
-
-    } catch {
-      try { conn.disconnect(); } catch {}
+      return conn;
+    } catch (err) {
+      try {
+        conn.disconnect();
+      } catch {}
     }
   }
+
   return null;
 }
 
-// TRACK
 async function track(username) {
   if (active.has(username)) return;
 
@@ -62,46 +68,55 @@ async function track(username) {
 
   console.log("LIVE:", username);
 
-  const session = await pool.query(
+  const sessionRes = await pool.query(
     "INSERT INTO live_sessions (username) VALUES ($1) RETURNING id",
     [username]
   );
 
-  const sessionId = session.rows[0].id;
+  const sessionId = sessionRes.rows[0].id;
 
-  conn.on(WebcastEvent.GIFT, async (data) => {
-    const total = data.diamondCount * (data.repeatCount || 1);
+  conn.on("gift", async (data) => {
+    try {
+      const repeatCount = Number(data?.repeatCount || 1);
+      const diamondCount = Number(data?.diamondCount || 0);
+      const totalDiamonds = diamondCount * repeatCount;
 
-    await pool.query(
-      `INSERT INTO live_gift_events 
-      (session_id, username, gifter_username, gifter_display_name, gift_name, total_diamonds) 
-      VALUES ($1,$2,$3,$4,$5,$6)`,
-      [
-        sessionId,
-        username,
-        data.uniqueId,
-        data.nickname,
-        data.giftName,
-        total
-      ]
-    );
+      await pool.query(
+        `INSERT INTO live_gift_events
+         (session_id, username, gifter_username, gifter_display_name, gift_name, total_diamonds)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [
+          sessionId,
+          username,
+          data?.uniqueId || null,
+          data?.nickname || null,
+          data?.giftName || null,
+          totalDiamonds
+        ]
+      );
+    } catch (err) {
+      console.error("GIFT INSERT ERROR:", username, err);
+    }
   });
 
   conn.on("disconnected", async () => {
-    console.log("ENDED:", username);
+    try {
+      console.log("ENDED:", username);
 
-    await pool.query(
-      "UPDATE live_sessions SET ended_at = NOW() WHERE id = $1",
-      [sessionId]
-    );
-
-    active.delete(username);
+      await pool.query(
+        "UPDATE live_sessions SET ended_at = NOW() WHERE id = $1",
+        [sessionId]
+      );
+    } catch (err) {
+      console.error("END SESSION ERROR:", username, err);
+    } finally {
+      active.delete(username);
+    }
   });
 
   active.set(username, conn);
 }
 
-// POLL
 async function poll() {
   console.log("Polling...");
 
@@ -110,17 +125,13 @@ async function poll() {
 
     for (let i = 0; i < creators.length; i += BATCH_SIZE) {
       const batch = creators.slice(i, i + BATCH_SIZE);
-
       await Promise.all(batch.map(username => track(username)));
-
-      await new Promise(r => setTimeout(r, BATCH_DELAY));
+      await new Promise(resolve => setTimeout(resolve, BATCH_DELAY));
     }
-
   } catch (err) {
     console.error("POLL ERROR:", err);
   }
 }
 
-// RUN
 setInterval(poll, 30000);
 poll();
