@@ -14,16 +14,16 @@ const active = new Map();
 const MAX_RETRIES = 2;
 const CONNECT_TIMEOUT = 5000;
 const BATCH_SIZE = 25;
-const BATCH_DELAY = 30000 / Math.ceil(1649 / 25) > 0 ? 300 : 300;
+const BATCH_DELAY = 300;
 
 console.log("STARTED");
 
-process.on('unhandledRejection', (err) => {
-  console.error('UNHANDLED REJECTION:', err);
+process.on("unhandledRejection", (err) => {
+  console.error("UNHANDLED REJECTION:", err);
 });
 
-process.on('uncaughtException', (err) => {
-  console.error('UNCAUGHT EXCEPTION:', err);
+process.on("uncaughtException", (err) => {
+  console.error("UNCAUGHT EXCEPTION:", err);
 });
 
 async function getCreators() {
@@ -34,7 +34,7 @@ async function getCreators() {
       AND agency_status != 'Quit'
   `);
 
-  return res.rows.map(row => row.username);
+  return res.rows.map((row) => row.username);
 }
 
 async function tryConnect(username) {
@@ -61,12 +61,14 @@ async function tryConnect(username) {
 }
 
 async function track(username) {
-  if (active.has(username)) return;
+  if (active.has(username)) {
+    return "already_active";
+  }
 
   const conn = await tryConnect(username);
-  if (!conn) return;
-
-  console.log("LIVE:", username);
+  if (!conn) {
+    return "not_live_or_failed";
+  }
 
   const sessionRes = await pool.query(
     "INSERT INTO live_sessions (username) VALUES ($1) RETURNING id",
@@ -77,20 +79,21 @@ async function track(username) {
 
   conn.on("gift", async (data) => {
     try {
-      const repeatCount = Number(data?.repeatCount || 1);
+      const giftCount = Number(data?.repeatCount || 1);
       const diamondCount = Number(data?.diamondCount || 0);
-      const totalDiamonds = diamondCount * repeatCount;
+      const totalDiamonds = diamondCount * giftCount;
 
       await pool.query(
         `INSERT INTO live_gift_events
-         (session_id, username, gifter_username, gifter_display_name, gift_name, total_diamonds)
-         VALUES ($1, $2, $3, $4, $5, $6)`,
+         (session_id, username, gifter_username, gifter_display_name, gift_name, gift_count, total_diamonds)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
         [
           sessionId,
           username,
           data?.uniqueId || null,
           data?.nickname || null,
           data?.giftName || null,
+          giftCount,
           totalDiamonds
         ]
       );
@@ -101,8 +104,6 @@ async function track(username) {
 
   conn.on("disconnected", async () => {
     try {
-      console.log("ENDED:", username);
-
       await pool.query(
         "UPDATE live_sessions SET ended_at = NOW() WHERE id = $1",
         [sessionId]
@@ -115,19 +116,33 @@ async function track(username) {
   });
 
   active.set(username, conn);
+  return "connected";
 }
 
 async function poll() {
-  console.log("Polling...");
-
   try {
     const creators = await getCreators();
 
+    let alreadyActiveCount = 0;
+    let connectedCount = 0;
+    let failedOrOfflineCount = 0;
+
     for (let i = 0; i < creators.length; i += BATCH_SIZE) {
       const batch = creators.slice(i, i + BATCH_SIZE);
-      await Promise.all(batch.map(username => track(username)));
-      await new Promise(resolve => setTimeout(resolve, BATCH_DELAY));
+      const results = await Promise.all(batch.map((username) => track(username)));
+
+      for (const result of results) {
+        if (result === "already_active") alreadyActiveCount++;
+        else if (result === "connected") connectedCount++;
+        else failedOrOfflineCount++;
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, BATCH_DELAY));
     }
+
+    console.log(
+      `POLL SUMMARY checked=${creators.length} active=${active.size} newly_connected=${connectedCount} already_active=${alreadyActiveCount} offline_or_failed=${failedOrOfflineCount}`
+    );
   } catch (err) {
     console.error("POLL ERROR:", err);
   }
