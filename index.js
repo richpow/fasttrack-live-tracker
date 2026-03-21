@@ -11,9 +11,9 @@ const pool = new Pool({
 
 const active = new Map();
 
-console.log("🚀 App started");
+console.log("STARTED");
 
-// GET CREATORS
+// GET CREATORS (EXCLUDES QUIT)
 async function getCreators() {
   const res = await pool.query(`
     SELECT username 
@@ -21,86 +21,87 @@ async function getCreators() {
     WHERE username IS NOT NULL
     AND agency_status != 'Quit'
   `);
-  console.log(`Loaded ${res.rowCount} creators`);
   return res.rows.map(r => r.username);
 }
 
-// CHECK IF LIVE
-async function isLive(username) {
-  try {
-    const conn = new TikTokLiveConnection(username);
-    const info = await conn.getRoomInfo();
-    return info?.status === 2;
-  } catch {
-    return false;
-  }
-}
-
-// START TRACKING
-async function track(username) {
+// MAIN TRACK FUNCTION (NO SEPARATE isLive)
+async function tryTrack(username) {
   if (active.has(username)) return;
-
-  console.log("🔴 LIVE:", username);
-
-  const session = await pool.query(
-    "INSERT INTO live_sessions (username) VALUES ($1) RETURNING id",
-    [username]
-  );
-
-  const sessionId = session.rows[0].id;
 
   const conn = new TikTokLiveConnection(username);
 
-  conn.on(WebcastEvent.GIFT, async (data) => {
-    const total = data.diamondCount * (data.repeatCount || 1);
+  try {
+    // Attempt to connect → THIS is the live check
+    await conn.connect();
 
-    console.log(`🎁 ${username} received ${data.giftName} x${data.repeatCount || 1}`);
+    console.log("LIVE:", username);
 
-    await pool.query(
-      `INSERT INTO live_gift_events 
-      (session_id, username, gifter_username, gifter_display_name, gift_name, total_diamonds) 
-      VALUES ($1,$2,$3,$4,$5,$6)`,
-      [
-        sessionId,
-        username,
-        data.uniqueId,
-        data.nickname,
-        data.giftName,
-        total
-      ]
-    );
-  });
-
-  conn.on("disconnected", async () => {
-    console.log("⚫ ENDED:", username);
-
-    await pool.query(
-      "UPDATE live_sessions SET ended_at = NOW() WHERE id = $1",
-      [sessionId]
+    const session = await pool.query(
+      "INSERT INTO live_sessions (username) VALUES ($1) RETURNING id",
+      [username]
     );
 
-    active.delete(username);
-  });
+    const sessionId = session.rows[0].id;
 
-  await conn.connect();
-  active.set(username, conn);
-}
+    conn.on(WebcastEvent.GIFT, async (data) => {
+      const total = data.diamondCount * (data.repeatCount || 1);
 
-// POLL LOOP
-async function poll() {
-  console.log("⏱ Polling...");
+      await pool.query(
+        `INSERT INTO live_gift_events 
+        (session_id, username, gifter_username, gifter_display_name, gift_name, total_diamonds) 
+        VALUES ($1,$2,$3,$4,$5,$6)`,
+        [
+          sessionId,
+          username,
+          data.uniqueId,
+          data.nickname,
+          data.giftName,
+          total
+        ]
+      );
+    });
 
-  const creators = await getCreators();
+    conn.on("disconnected", async () => {
+      console.log("ENDED:", username);
 
-  for (const username of creators) {
-    if (active.has(username)) continue;
+      await pool.query(
+        "UPDATE live_sessions SET ended_at = NOW() WHERE id = $1",
+        [sessionId]
+      );
 
-    const live = await isLive(username);
-    if (live) await track(username);
+      active.delete(username);
+    });
+
+    active.set(username, conn);
+
+  } catch {
+    // Not live → silently ignore
   }
 }
 
-setInterval(poll, 30000);
+// POLLING WITH CONTROLLED CONCURRENCY
+async function poll() {
+  console.log("Polling...");
 
-// RUN IMMEDIATELY
+  try {
+    const creators = await getCreators();
+
+    // Limit parallel attempts to avoid overload
+    const chunkSize = 50;
+
+    for (let i = 0; i < creators.length; i += chunkSize) {
+      const chunk = creators.slice(i, i + chunkSize);
+
+      await Promise.all(
+        chunk.map(username => tryTrack(username))
+      );
+    }
+
+  } catch (err) {
+    console.error("POLL ERROR:", err);
+  }
+}
+
+// RUN
+setInterval(poll, 30000);
 poll();
