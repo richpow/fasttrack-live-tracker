@@ -11,7 +11,9 @@ const pool = new Pool({
 
 const active = new Map();
 
-// GET CREATORS (EXCLUDES QUIT)
+console.log("🚀 App started");
+
+// GET CREATORS
 async function getCreators() {
   const res = await pool.query(`
     SELECT username 
@@ -19,6 +21,7 @@ async function getCreators() {
     WHERE username IS NOT NULL
     AND agency_status != 'Quit'
   `);
+  console.log(`Loaded ${res.rowCount} creators`);
   return res.rows.map(r => r.username);
 }
 
@@ -37,7 +40,7 @@ async function isLive(username) {
 async function track(username) {
   if (active.has(username)) return;
 
-  console.log("LIVE:", username);
+  console.log("🔴 LIVE:", username);
 
   const session = await pool.query(
     "INSERT INTO live_sessions (username) VALUES ($1) RETURNING id",
@@ -50,6 +53,8 @@ async function track(username) {
 
   conn.on(WebcastEvent.GIFT, async (data) => {
     const total = data.diamondCount * (data.repeatCount || 1);
+
+    console.log(`🎁 ${username} received ${data.giftName} x${data.repeatCount || 1}`);
 
     await pool.query(
       `INSERT INTO live_gift_events 
@@ -67,7 +72,7 @@ async function track(username) {
   });
 
   conn.on("disconnected", async () => {
-    console.log("ENDED:", username);
+    console.log("⚫ ENDED:", username);
 
     await pool.query(
       "UPDATE live_sessions SET ended_at = NOW() WHERE id = $1",
@@ -81,19 +86,21 @@ async function track(username) {
   active.set(username, conn);
 }
 
-// POLL EVERY 30 SECONDS
+// POLL LOOP
 async function poll() {
+  console.log("⏱ Polling...");
+
   const creators = await getCreators();
 
-  await Promise.all(
-    creators.map(async (username) => {
-      if (active.has(username)) return;
+  for (const username of creators) {
+    if (active.has(username)) continue;
 
-      const live = await isLive(username);
-      if (live) await track(username);
-    })
-  );
+    const live = await isLive(username);
+    if (live) await track(username);
+  }
 }
 
 setInterval(poll, 30000);
+
+// RUN IMMEDIATELY
 poll();
